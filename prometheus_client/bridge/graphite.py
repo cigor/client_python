@@ -13,6 +13,7 @@ from .. import core
 # We also remove periods, so labels can be distinguished.
 _INVALID_GRAPHITE_CHARS = re.compile(r"[^a-zA-Z0-9_-]")
 
+LOG = logging.getLogger('graphite-bridge')
 
 def _sanitize(s):
     return _INVALID_GRAPHITE_CHARS.sub('_', s)
@@ -40,39 +41,46 @@ class _RegularPush(threading.Thread):
             try:
                 self._pusher.push(prefix=self._prefix)
             except IOError:
-                logging.exception("Push failed")
+                LOG.error("Push failed")
 
 
 class GraphiteBridge(object):
-    def __init__(self, address, registry=core.REGISTRY, timeout_seconds=30, _time=time):
+    def __init__(self, address, registry=core.REGISTRY, timeout_seconds=30, _time=time, label_templates={}):
         self._address = address
         self._registry = registry
         self._timeout = timeout_seconds
         self._time = _time
+        self._label_templates = label_templates
 
     def push(self, prefix=''):
         now = int(self._time.time())
         output = []
 
-        prefixstr = ''
-        if prefix:
-            prefixstr = prefix + '.'
+        prefixstr = prefix or ''
 
         for metric in self._registry.collect():
             for name, labels, value in metric.samples:
-                if labels:
-                    labelstr = '.' + '.'.join(
-                        ['{0}.{1}'.format(
-                             _sanitize(k), _sanitize(v))
-                             for k, v in sorted(labels.items())])
+                label_dict = dict(
+                            (_sanitize(k), _sanitize(v))
+                            for k, v in sorted(labels.items()))
+                label_dict['name'] = name
+                if name in self._label_templates:
+                    labelstr = self._label_templates[name].format( **label_dict)
                 else:
-                    labelstr = ''
-                output.append('{0}{1}{2} {3} {4}\n'.format(
-                    prefixstr, _sanitize(name), labelstr, float(value), now))
+                    labelstr = '.'.join([_sanitize(name)] +
+                    ['{0}.{1}'.format(
+                            _sanitize(k), _sanitize(v))
+                            for k, v in sorted(labels.items())])
+                output.append('{0}.{1} {2} {3}\n'.format(
+                    prefixstr, labelstr, float(value), now))
 
-        conn = socket.create_connection(self._address, self._timeout)
-        conn.sendall(''.join(output).encode('ascii'))
-        conn.close()
+
+        try:
+            conn = socket.create_connection(self._address, self._timeout)
+            conn.sendall(''.join(output).encode('ascii'))
+            conn.close()
+        except Exception as e:
+            LOG.error('Could not connect to graphite at %s', self._address)
 
     def start(self, interval=60.0, prefix=''):
         t = _RegularPush(self, interval, prefix)
